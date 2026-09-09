@@ -1,1 +1,8 @@
-PLACEHOLDER
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question
+    url: https://github.com/orgs/Universal-Standard/discussions
+    about: For usage questions and general discussion, not bugs.
+  - name: Report a security vulnerability
+    url: https://github.com/Universal-Standard/.github/security/policy
+    about: Please do not report security vulnerabilities through public GitHub issues.
