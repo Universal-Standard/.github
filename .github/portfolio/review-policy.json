@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "reviewSources": ["copilot", "codex", "claude"],
+  "remediationTrigger": {
+    "changesRequested": true,
+    "actionableReviewComments": true,
+    "explicitCommand": "/remediate"
+  },
+  "freshness": {
+    "reviewMustMatchCurrentHead": true,
+    "newCommitInvalidatesVerifiedState": true
+  },
+  "merge": {
+    "useGitHubAutoMerge": true,
+    "neverBypassRulesets": true,
+    "manualReviewLabels": [
+      "security/manual-review",
+      "governance/manual-review"
+    ]
+  }
+}
