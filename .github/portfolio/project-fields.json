@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "fieldNames": {
+    "status": "Status",
+    "primarySystem": "Primary System",
+    "area": "Area",
+    "repository": "Repository",
+    "integrationState": "Integration State"
+  },
+  "expectedOptions": {
+    "integrationState": ["Standalone", "Required"],
+    "status": [
+      "Triage",
+      "Draft",
+      "Implementation",
+      "Needs Review",
+      "Remediation",
+      "Verified",
+      "Merge Ready",
+      "Awaiting Final Approval",
+      "Agent Blocked",
+      "Merged",
+      "Closed"
+    ],
+    "primarySystem": [
+      "ATLANTIS",
+      "SWARM",
+      "HITMAN",
+      "Universal Standards",
+      "CAROMAR",
+      "MCP Server"
+    ]
+  }
+}
