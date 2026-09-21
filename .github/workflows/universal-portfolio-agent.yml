@@ -99,6 +99,7 @@ jobs:
             ]);
 
             const definitions = labelPolicy.labels;
+            const previewOnly = context.eventName === "workflow_dispatch" && process.env.DRY_RUN === "true";
             const existing = await github.paginate(github.rest.issues.listLabelsForRepo, {
               owner,
               repo,
@@ -108,6 +109,10 @@ jobs:
 
             for (const [name, value] of Object.entries(definitions)) {
               if (existingNames.has(name)) continue;
+              if (previewOnly) {
+                core.notice("Dry-run: would create label " + name);
+                continue;
+              }
               try {
                 await github.rest.issues.createLabel({
                   owner,
@@ -184,6 +189,19 @@ jobs:
             if (detected.size > 1) {
               classification.push("scope/cross-system", "integration/required");
             }
+
+            const managedSystemLabels = Object.values(catalog.systems).map(system => system.label);
+            const desiredManaged = new Set(classification);
+            for (const label of [
+              ...managedSystemLabels,
+              "scope/cross-system",
+              "integration/required"
+            ]) {
+              if (currentLabels.has(label) && !desiredManaged.has(label)) {
+                await removeLabel(label);
+              }
+            }
+
             await addLabels(classification);
 
             const lifecycleStatuses = [
@@ -225,6 +243,17 @@ jobs:
                 await addLabels(["review/required"]);
               } else if (action === "synchronize") {
                 await removeLabel("finding/resolved");
+
+                try {
+                  await github.graphql(
+                    "mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){pullRequest{number}}}",
+                    { id: pr.node_id }
+                  );
+                  core.notice("Disabled any existing auto-merge request until the new HEAD is reviewed.");
+                } catch (error) {
+                  core.notice("No active auto-merge request to disable, or auto-merge is unavailable: " + error.message);
+                }
+
                 if (!currentLabels.has("status/remediation")) {
                   await setLifecycle("status/needs-review");
                   await addLabels(["review/required"]);
