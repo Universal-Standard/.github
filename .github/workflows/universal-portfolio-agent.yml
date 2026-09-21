@@ -240,6 +240,32 @@ jobs:
           configuration-path: .github/labeler.yml
           sync-labels: true
 
+      - name: Request Copilot review for the current PR HEAD
+        if: github.event_name == 'pull_request_target' && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || github.event.action == 'synchronize') && github.event.pull_request.draft == false
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+            if (!pr || pr.state !== "open" || pr.draft) return;
+
+            try {
+              await github.rest.pulls.requestReviewers({
+                owner,
+                repo,
+                pull_number: pr.number,
+                reviewers: ["copilot-pull-request-reviewer[bot]"]
+              });
+              core.notice("Requested Copilot code review for HEAD " + pr.head.sha + ".");
+            } catch (error) {
+              if ([403, 404, 422].includes(error.status)) {
+                core.warning("Copilot code review could not be requested automatically: " + error.message);
+                return;
+              }
+              throw error;
+            }
+
       - name: Auto-assign new issues to Copilot
         if: github.event_name == 'issues' && github.event.action == 'opened' && env.COPILOT_AGENT_TOKEN != ''
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
