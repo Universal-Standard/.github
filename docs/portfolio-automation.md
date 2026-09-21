@@ -10,7 +10,7 @@ The baseline covers ATLANTIS, SWARM, HITMAN, Universal Standards, CAROMAR, and t
 
 1. A new issue is classified and, unless excluded by policy, assigned to GitHub Copilot cloud agent.
 2. Copilot implements the issue and opens or updates a pull request.
-3. Existing repository CI, CodeQL, tests, Copilot code review, Codex, Claude, and human reviewers may report findings.
+3. The workflow requests Copilot code review when a PR is opened, reopened, marked ready, and after every new push; existing CI, CodeQL, tests, Codex, Claude, and human reviewers may also report findings.
 4. Actionable review comments from Copilot, Codex, or Claude are aggregated and deduplicated.
 5. A Copilot Agent Task is started against the existing pull-request branch.
 6. Every new commit invalidates verified/merge-ready state and requires a fresh review.
@@ -49,7 +49,7 @@ Optional repository/organization variable containing the ProjectV2 node ID.
 
 ## Repository settings still required
 
-For the fully closed review-remediate-review loop, enable Copilot code review for the repository and configure it to review new pushes. Keep branch rulesets and required checks enabled. This automation never bypasses those protections.
+The workflow explicitly requests Copilot code review for each eligible new PR HEAD, including after remediation pushes. Repository/organization rulesets may also enable automatic Copilot review and Review new pushes as defense in depth. Keep branch rulesets and required checks enabled. This automation never bypasses those protections.
 
 ## Manual safety gates
 
