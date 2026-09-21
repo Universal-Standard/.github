@@ -1,0 +1,941 @@
+name: Universal Portfolio and Agent Loop
+
+on:
+  workflow_call:
+    inputs:
+      system:
+        description: Primary portfolio system for the caller repository.
+        required: true
+        type: string
+      policy_ref:
+        description: Immutable ref in Universal-Standard/.github used to load portfolio policy.
+        required: false
+        type: string
+        default: main
+      project_id:
+        description: Optional GitHub ProjectV2 node ID.
+        required: false
+        type: string
+        default: ""
+      enable_auto_merge:
+        description: Arm GitHub auto-merge after an approved current-head review when policy allows.
+        required: false
+        type: boolean
+        default: true
+      max_remediation_passes:
+        description: Circuit breaker for repeated autonomous remediation.
+        required: false
+        type: number
+        default: 10
+      reconcile_mode:
+        description: Manual reconciliation mode supplied by workflow_dispatch caller.
+        required: false
+        type: string
+        default: current-item
+      dry_run:
+        description: Do not mutate items during manual reconciliation.
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      COPILOT_AGENT_TOKEN:
+        description: Fine-grained user token with Agent tasks read/write and issue permissions.
+        required: false
+      PROJECTS_TOKEN:
+        description: Token with GitHub Projects v2 write permission.
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: portfolio-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_suite.id || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  control:
+    name: Portfolio control plane
+    runs-on: ubuntu-latest
+    env:
+      PRIMARY_SYSTEM: ${{ inputs.system }}
+      POLICY_REF: ${{ inputs.policy_ref }}
+      PORTFOLIO_PROJECT_ID: ${{ inputs.project_id }}
+      COPILOT_AGENT_TOKEN: ${{ secrets.COPILOT_AGENT_TOKEN }}
+      PROJECTS_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+      MAX_REMEDIATION_PASSES: ${{ inputs.max_remediation_passes }}
+      ENABLE_AUTO_MERGE: ${{ inputs.enable_auto_merge }}
+      RECONCILE_MODE: ${{ inputs.reconcile_mode }}
+      DRY_RUN: ${{ inputs.dry_run }}
+
+    steps:
+      - name: Bootstrap labels, classify systems, and maintain lifecycle state
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const item = context.payload.pull_request || context.payload.issue;
+
+            async function loadPolicy(path) {
+              const response = await github.rest.repos.getContent({
+                owner: "Universal-Standard",
+                repo: ".github",
+                path,
+                ref: process.env.POLICY_REF
+              });
+              if (Array.isArray(response.data) || !response.data.content) {
+                throw new Error("Policy path is not a file: " + path);
+              }
+              return JSON.parse(Buffer.from(response.data.content, "base64").toString("utf8"));
+            }
+
+            const [labelPolicy, catalog] = await Promise.all([
+              loadPolicy(".github/portfolio/labels.json"),
+              loadPolicy(".github/portfolio/portfolio-catalog.json")
+            ]);
+
+            const definitions = labelPolicy.labels;
+            const forkReadOnly = context.eventName === "pull_request" &&
+              context.payload.pull_request?.head?.repo?.full_name !== owner + "/" + repo;
+            const previewOnly = context.eventName === "workflow_dispatch" && process.env.DRY_RUN === "true";
+            const existing = await github.paginate(github.rest.issues.listLabelsForRepo, {
+              owner,
+              repo,
+              per_page: 100
+            });
+            const existingNames = new Set(existing.map(label => label.name));
+
+            for (const [name, value] of Object.entries(definitions)) {
+              if (existingNames.has(name)) continue;
+              if (previewOnly || forkReadOnly) {
+                core.notice((previewOnly ? "Dry-run" : "Fork PR read-only run") + ": would create label " + name);
+                continue;
+              }
+              try {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name,
+                  color: value[0],
+                  description: value[1]
+                });
+              } catch (error) {
+                if (error.status !== 422) throw error;
+              }
+            }
+
+            if (!item) {
+              core.notice("No issue or pull request for this event; label catalog synchronized.");
+              return;
+            }
+
+            if (forkReadOnly) {
+              core.notice("Skipping repository mutations for a fork pull request. Maintainer-controlled issue/review events remain available for safe follow-up.");
+              return;
+            }
+
+            const number = item.number;
+            const current = await github.rest.issues.get({
+              owner,
+              repo,
+              issue_number: number
+            });
+            const currentLabels = new Set((current.data.labels || []).map(label => typeof label === "string" ? label : label.name));
+
+            async function addLabels(names) {
+              const labels = [...new Set(names)].filter(Boolean);
+              if (!labels.length) return;
+              await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels });
+              labels.forEach(label => currentLabels.add(label));
+            }
+
+            async function removeLabel(name) {
+              if (!currentLabels.has(name)) return;
+              try {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+              currentLabels.delete(name);
+            }
+
+            const isPR = Boolean(context.payload.pull_request || context.payload.issue?.pull_request);
+            const primaryKey = process.env.PRIMARY_SYSTEM;
+            const primary = catalog.systems[primaryKey];
+            if (!primary) throw new Error("Unknown portfolio system: " + primaryKey);
+
+            const title = item.title || "";
+            const body = item.body || "";
+            const text = title + "\n" + body;
+            const detected = new Set([primaryKey]);
+
+            const escapeRegex = value => value.replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
+
+            for (const [key, system] of Object.entries(catalog.systems)) {
+              const structured = new RegExp("\\[x-system:\\s*" + escapeRegex(key) + "\\s*\\]", "i");
+              if (structured.test(text)) detected.add(key);
+
+              const repositories = [system.canonical, ...(system.aliases || [])];
+              for (const fullName of repositories) {
+                const escaped = escapeRegex(fullName);
+                const issueRef = new RegExp("\\b" + escaped + "#\\d+\\b", "i");
+                const urlRef = new RegExp("github\\.com/" + escaped + "/(?:issues|pull)/\\d+", "i");
+                if (issueRef.test(text) || urlRef.test(text)) detected.add(key);
+              }
+            }
+
+            const systemLabels = [...detected].map(key => catalog.systems[key].label);
+            const classification = [
+              isPR ? "kind/pull-request" : "kind/issue",
+              ...systemLabels
+            ];
+            if (detected.size > 1) {
+              classification.push("scope/cross-system", "integration/required");
+            }
+
+            const managedSystemLabels = Object.values(catalog.systems).map(system => system.label);
+            const desiredManaged = new Set(classification);
+            for (const label of [
+              ...managedSystemLabels,
+              "scope/cross-system",
+              "integration/required"
+            ]) {
+              if (currentLabels.has(label) && !desiredManaged.has(label)) {
+                await removeLabel(label);
+              }
+            }
+
+            await addLabels(classification);
+
+            const lifecycleStatuses = [
+              "status/triage",
+              "status/draft",
+              "status/implementation",
+              "status/needs-review",
+              "status/remediation",
+              "status/verified",
+              "status/merge-ready",
+              "status/awaiting-final-approval",
+              "status/agent-blocked",
+              "status/merged",
+              "status/closed"
+            ];
+
+            async function setLifecycle(status) {
+              for (const label of lifecycleStatuses) {
+                if (label !== status) await removeLabel(label);
+              }
+              await addLabels([status]);
+            }
+
+            const event = context.eventName;
+            const action = context.payload.action;
+
+            if (event === "issues" && ["opened", "reopened"].includes(action)) {
+              await setLifecycle("status/triage");
+            } else if (event === "issues" && action === "closed") {
+              await setLifecycle("status/closed");
+            } else if (event === "pull_request") {
+              const pr = context.payload.pull_request;
+              if (action === "closed") {
+                await setLifecycle(pr.merged ? "status/merged" : "status/closed");
+              } else if (action === "converted_to_draft" || pr.draft) {
+                await setLifecycle("status/draft");
+              } else if (["opened", "reopened", "ready_for_review"].includes(action)) {
+                await setLifecycle("status/needs-review");
+                await addLabels(["review/required"]);
+              } else if (action === "synchronize") {
+                await removeLabel("finding/resolved");
+
+                try {
+                  await github.graphql(
+                    "mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){pullRequest{number}}}",
+                    { id: pr.node_id }
+                  );
+                  core.notice("Disabled any existing auto-merge request until the new HEAD is reviewed.");
+                } catch (error) {
+                  core.notice("No active auto-merge request to disable, or auto-merge is unavailable: " + error.message);
+                }
+
+                if (!currentLabels.has("status/remediation")) {
+                  await setLifecycle("status/needs-review");
+                  await addLabels(["review/required"]);
+                }
+              }
+            }
+
+      - name: Apply deterministic path-area labels
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7
+        with:
+          repo-token: ${{ github.token }}
+          configuration-path: .github/labeler.yml
+          sync-labels: true
+
+      - name: Request Copilot review for the current PR HEAD
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || github.event.action == 'synchronize') && github.event.pull_request.draft == false
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+            if (!pr || pr.state !== "open" || pr.draft) return;
+
+            try {
+              await github.rest.pulls.requestReviewers({
+                owner,
+                repo,
+                pull_number: pr.number,
+                reviewers: ["copilot-pull-request-reviewer[bot]"]
+              });
+              core.notice("Requested Copilot code review for HEAD " + pr.head.sha + ".");
+            } catch (error) {
+              if ([403, 404, 422].includes(error.status)) {
+                core.warning("Copilot code review could not be requested automatically: " + error.message);
+                return;
+              }
+              throw error;
+            }
+
+      - name: Auto-assign new issues to Copilot
+        if: github.event_name == 'issues' && github.event.action == 'opened' && env.COPILOT_AGENT_TOKEN != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ env.COPILOT_AGENT_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue = context.payload.issue;
+            const excluded = new Set([
+              "agent/manual",
+              "no-agent",
+              "security/manual-review",
+              "governance/manual-review"
+            ]);
+            const labels = new Set((issue.labels || []).map(label => label.name));
+            if ([...excluded].some(label => labels.has(label))) {
+              core.notice("Issue is excluded from autonomous assignment by policy.");
+              return;
+            }
+
+            const repository = await github.rest.repos.get({ owner, repo });
+            await github.request("POST /repos/{owner}/{repo}/issues/{issue_number}/assignees", {
+              owner,
+              repo,
+              issue_number: issue.number,
+              assignees: ["copilot-swe-agent[bot]"],
+              agent_assignment: {
+                target_repo: owner + "/" + repo,
+                base_branch: repository.data.default_branch,
+                custom_instructions: "Reproduce the issue, fix the root cause, add regression coverage where appropriate, run the applicable verification suite, and open a pull request. Follow repository instructions and do not weaken tests or protections.",
+                custom_agent: "universal-remediation-agent",
+                model: ""
+              },
+              headers: {
+                "X-GitHub-Api-Version": "2022-11-28"
+              }
+            });
+
+            try {
+              await github.rest.issues.removeLabel({
+                owner,
+                repo,
+                issue_number: issue.number,
+                name: "status/triage"
+              });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
+            await github.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number: issue.number,
+              labels: ["agent/assigned", "status/implementation"]
+            });
+
+      - name: Mark missing Copilot agent configuration
+        if: github.event_name == 'issues' && github.event.action == 'opened' && env.COPILOT_AGENT_TOKEN == ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue = context.payload.issue;
+            const labels = new Set((issue.labels || []).map(label => label.name));
+            if (["agent/manual", "no-agent", "security/manual-review", "governance/manual-review"].some(label => labels.has(label))) return;
+
+            await github.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number: issue.number,
+              labels: ["agent/pending-configuration"]
+            });
+
+            const comments = await github.rest.issues.listComments({
+              owner,
+              repo,
+              issue_number: issue.number,
+              per_page: 100
+            });
+            if (!comments.data.some(comment => (comment.body || "").includes("<!-- universal-agent-token-missing -->"))) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: "<!-- universal-agent-token-missing -->\\nAutonomous assignment is ready, but this repository has not supplied the optional COPILOT_AGENT_TOKEN secret required for Copilot cloud-agent assignment."
+              });
+            }
+
+      - name: Remediate actionable AI review findings
+        if: (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment' || github.event_name == 'pull_request_review') && env.COPILOT_AGENT_TOKEN != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const actor = context.actor || "";
+            const event = context.eventName;
+
+            let prNumber;
+            let body = "";
+            let reviewState = "";
+            let actorType = "";
+
+            if (event === "issue_comment") {
+              if (!context.payload.issue?.pull_request) return;
+              prNumber = context.payload.issue.number;
+              body = context.payload.comment?.body || "";
+              actorType = context.payload.comment?.user?.type || "";
+            } else if (event === "pull_request_review_comment") {
+              prNumber = context.payload.pull_request.number;
+              body = context.payload.comment?.body || "";
+              actorType = context.payload.comment?.user?.type || "";
+            } else {
+              prNumber = context.payload.pull_request.number;
+              body = context.payload.review?.body || "";
+              reviewState = (context.payload.review?.state || "").toLowerCase();
+              actorType = context.payload.review?.user?.type || "";
+            }
+
+            if (!prNumber || body.includes("<!-- universal-remediation-pass:")) return;
+
+            const aiReviewer = actorType === "Bot" && /(copilot|codex|claude)/i.test(actor);
+            const explicitCommand = /^\\s*\\/remediate\\b/i.test(body);
+
+            if (explicitCommand && !aiReviewer) {
+              const permission = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner,
+                repo,
+                username: actor
+              });
+              if (!["write", "maintain", "admin"].includes(permission.data.permission)) {
+                core.warning("Ignoring /remediate from a user without write-level repository access.");
+                return;
+              }
+            }
+
+            if (!aiReviewer && !explicitCommand) return;
+
+            const actionPattern = /\\b(fix|must|should|issue|bug|incorrect|failure|fails|problem|risk|vulnerab|security|performance|regression|recommend|suggest|add|change|replace|remove|avoid|consider|instead|refactor|optimiz|leak|race|deadlock|exception|error)\\w*\\b/i;
+            const cleanOnly = /\\b(no (?:issues|findings|problems)|looks good|approved|lgtm|no changes requested)\\b/i.test(body);
+            const actionable = !cleanOnly && (
+              reviewState === "changes_requested" ||
+              (event === "pull_request_review_comment" && aiReviewer) ||
+              actionPattern.test(body)
+            );
+
+            if (!actionable) {
+              core.notice("Review event does not contain an actionable remediation signal.");
+              return;
+            }
+
+            const prResponse = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            const pr = prResponse.data;
+            if (pr.state !== "open" || pr.draft) return;
+
+            try {
+              await github.graphql(
+                "mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){pullRequest{number}}}",
+                { id: pr.node_id }
+              );
+              core.notice("Disabled any active auto-merge request because actionable review feedback arrived.");
+            } catch (error) {
+              core.notice("No active auto-merge request to disable, or auto-merge is unavailable: " + error.message);
+            }
+
+            const lifecycleStatuses = [
+              "status/triage",
+              "status/draft",
+              "status/implementation",
+              "status/needs-review",
+              "status/remediation",
+              "status/verified",
+              "status/merge-ready",
+              "status/awaiting-final-approval",
+              "status/agent-blocked",
+              "status/merged",
+              "status/closed"
+            ];
+
+            async function setLifecycle(status, extras = []) {
+              const issueState = await github.rest.issues.get({ owner, repo, issue_number: prNumber });
+              const currentLabels = new Set((issueState.data.labels || []).map(label => typeof label === "string" ? label : label.name));
+              for (const label of lifecycleStatuses) {
+                if (label === status || !currentLabels.has(label)) continue;
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: label });
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+              }
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: prNumber,
+                labels: [status, ...extras]
+              });
+            }
+
+            if (pr.head.repo?.full_name !== owner + "/" + repo) {
+              await setLifecycle("status/agent-blocked", ["finding/actionable"]);
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body: "<!-- universal-remediation-fork-block -->\\nAutomatic remediation is not being started because this PR branch is hosted in a fork. A maintainer must choose a safe remediation path."
+              });
+              return;
+            }
+
+            const [issueComments, reviewComments, reviews] = await Promise.all([
+              github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 }),
+              github.paginate(github.rest.pulls.listReviewComments, { owner, repo, pull_number: prNumber, per_page: 100 }),
+              github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: prNumber, per_page: 100 })
+            ]);
+
+            const passMarkers = issueComments
+              .map(comment => comment.body || "")
+              .filter(text => text.includes("<!-- universal-remediation-pass:"));
+
+            const activeHeadMarker = passMarkers.find(marker => marker.includes("head=" + pr.head.sha));
+            if (activeHeadMarker) {
+              core.notice("A remediation pass has already been started for current HEAD " + pr.head.sha + "; aggregating will resume after the agent pushes a new commit.");
+              return;
+            }
+
+            const maxPasses = Number(process.env.MAX_REMEDIATION_PASSES || "10");
+            if (passMarkers.length >= maxPasses) {
+              await setLifecycle("status/agent-blocked", ["finding/actionable"]);
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body: "<!-- universal-remediation-circuit-breaker -->\\nAutonomous remediation stopped after " + maxPasses + " passes. The same PR now requires maintainer review before more agent work is started."
+              });
+              return;
+            }
+
+            function isActionableText(text) {
+              return actionPattern.test(text || "");
+            }
+
+            const findings = [];
+            for (const comment of reviewComments) {
+              if (/(copilot|codex|claude)/i.test(comment.user?.login || "") && isActionableText(comment.body)) {
+                findings.push((comment.user?.login || "reviewer") + ": " + comment.body);
+              }
+            }
+            for (const review of reviews) {
+              if (/(copilot|codex|claude)/i.test(review.user?.login || "") &&
+                  (String(review.state).toLowerCase() === "changes_requested" || isActionableText(review.body))) {
+                findings.push((review.user?.login || "reviewer") + ": " + (review.body || "Changes requested"));
+              }
+            }
+            for (const comment of issueComments) {
+              if ((comment.body || "").includes("<!-- universal-remediation-")) continue;
+              if (/(copilot|codex|claude)/i.test(comment.user?.login || "") && isActionableText(comment.body)) {
+                findings.push((comment.user?.login || "reviewer") + ": " + comment.body);
+              }
+            }
+            if (explicitCommand && body) findings.push(actor + ": " + body);
+
+            const unique = [...new Set(findings.map(value => value.trim()).filter(Boolean))].slice(-30);
+            if (!unique.length) unique.push(actor + ": " + body);
+
+            const crypto = require("crypto");
+            const signature = crypto.createHash("sha256")
+              .update(unique.map(value => value.toLowerCase().replace(/\\s+/g, " ")).sort().join("\\n"))
+              .digest("hex")
+              .slice(0, 16);
+
+            const repeated = passMarkers.filter(marker => marker.includes("signature=" + signature)).length;
+            if (repeated >= 2) {
+              await setLifecycle("status/agent-blocked", ["finding/actionable"]);
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body: "<!-- universal-remediation-repeat-block signature=" + signature + " -->\\nThe same normalized review findings survived two autonomous remediation passes. The loop is paused for maintainer diagnosis."
+              });
+              return;
+            }
+
+            const pass = passMarkers.length + 1;
+            const prompt = [
+              "AUTONOMOUS REMEDIATION PASS " + pass,
+              "",
+              "Work on the existing pull request #" + prNumber + " at current HEAD " + pr.head.sha + ".",
+              "Address every still-valid actionable finding below in one consolidated pass.",
+              "",
+              unique.map((finding, index) => (index + 1) + ". " + finding.slice(0, 1800)).join("\\n\\n"),
+              "",
+              "Requirements:",
+              "- Re-evaluate each finding against current HEAD before editing.",
+              "- Deduplicate overlapping findings and fix root causes.",
+              "- Do not weaken tests, validation, security controls, authorization, observability, or branch protections.",
+              "- Add or update regression tests where appropriate.",
+              "- Run applicable tests, lint, type checking, and build checks before concluding.",
+              "- Commit fixes to this existing PR branch; do not create a second PR.",
+              "- If a finding is invalid, explain why with concrete code evidence rather than suppressing it."
+            ].join("\\n");
+
+            const agent = getOctokit(process.env.COPILOT_AGENT_TOKEN);
+            const task = await agent.request("POST /agents/repos/{owner}/{repo}/tasks", {
+              owner,
+              repo,
+              prompt,
+              head_ref: pr.head.ref,
+              base_ref: pr.base.ref,
+              create_pull_request: false,
+              custom_agent: "universal-remediation-agent",
+              headers: {
+                "X-GitHub-Api-Version": "2026-03-10",
+                "Accept": "application/vnd.github+json"
+              }
+            });
+
+            try {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: "finding/resolved" });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            await setLifecycle("status/remediation", ["agent/remediation", "finding/actionable", "review/required"]);
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: prNumber,
+              body: "<!-- universal-remediation-pass:" + pass + " signature=" + signature + " head=" + pr.head.sha + " -->\\nStarted consolidated Copilot remediation pass **" + pass + "** for the current review findings." +
+                (task.data?.html_url ? "\\n\\nAgent task: " + task.data.html_url : "")
+            });
+
+      - name: Sync issue or PR into the portfolio Project
+        if: (github.event_name == 'issues' || github.event_name == 'pull_request') && env.PROJECTS_TOKEN != '' && env.PORTFOLIO_PROJECT_ID != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const item = context.payload.pull_request || context.payload.issue;
+            if (!item?.node_id) return;
+
+            const project = getOctokit(process.env.PROJECTS_TOKEN);
+            const projectId = process.env.PORTFOLIO_PROJECT_ID;
+
+            const added = await project.graphql(
+              "mutation($project:ID!,$content:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$content}){item{id}}}",
+              { project: projectId, content: item.node_id }
+            );
+            const itemId = added.addProjectV2ItemById.item.id;
+
+            const data = await project.graphql(
+              "query($id:ID!){node(id:$id){... on ProjectV2{fields(first:100){nodes{" +
+              "... on ProjectV2Field{id name dataType}" +
+              "... on ProjectV2SingleSelectField{id name options{id name}}" +
+              "}}}}}",
+              { id: projectId }
+            );
+
+            const fields = data.node.fields.nodes || [];
+            const issue = await github.rest.issues.get({ owner, repo, issue_number: item.number });
+            const labels = (issue.data.labels || []).map(label => typeof label === "string" ? label : label.name);
+
+            const statusLabel = labels.find(label => label.startsWith("status/"));
+            const areaLabel = labels.find(label => label.startsWith("area/"));
+            const crossSystem = labels.includes("integration/required");
+
+            const titleCase = value => value
+              .split("-")
+              .map(part => part ? part[0].toUpperCase() + part.slice(1) : part)
+              .join(" ");
+
+            const systemNames = {
+              "atlantis": "ATLANTIS",
+              "swarm": "SWARM",
+              "hitman": "HITMAN",
+              "universal-standards": "Universal Standards",
+              "caromar": "CAROMAR",
+              "mcp-server": "MCP Server"
+            };
+
+            const areaNames = {
+              "ci-cd": "CI/CD",
+              "mcp": "MCP",
+              "api": "API"
+            };
+
+            async function setSingleSelect(fieldName, optionName) {
+              if (!optionName) return;
+              const field = fields.find(field => field?.name === fieldName && Array.isArray(field.options));
+              if (!field) return;
+              const option = field.options.find(option => option.name.toLowerCase() === optionName.toLowerCase());
+              if (!option) return;
+              await project.graphql(
+                "mutation($project:ID!,$item:ID!,$field:ID!,$option:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{singleSelectOptionId:$option}}){projectV2Item{id}}}",
+                { project: projectId, item: itemId, field: field.id, option: option.id }
+              );
+            }
+
+            async function setText(fieldName, value) {
+              if (!value) return;
+              const field = fields.find(field => field?.name === fieldName && field.dataType === "TEXT");
+              if (!field) return;
+              await project.graphql(
+                "mutation($project:ID!,$item:ID!,$field:ID!,$value:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{text:$value}}){projectV2Item{id}}}",
+                { project: projectId, item: itemId, field: field.id, value }
+              );
+            }
+
+            await setSingleSelect("Primary System", systemNames[process.env.PRIMARY_SYSTEM] || titleCase(process.env.PRIMARY_SYSTEM));
+            if (statusLabel) await setSingleSelect("Status", titleCase(statusLabel.slice("status/".length)));
+            if (areaLabel) {
+              const area = areaLabel.slice("area/".length);
+              await setSingleSelect("Area", areaNames[area] || titleCase(area));
+            }
+            await setSingleSelect("Integration State", crossSystem ? "Required" : "Standalone");
+            await setText("Repository", owner + "/" + repo);
+
+      - name: Manual portfolio reconciliation and backfill
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const mode = process.env.RECONCILE_MODE || "current-item";
+            const dryRun = process.env.DRY_RUN === "true";
+            if (!["open-items", "all-items", "labels-only", "full-reconcile"].includes(mode)) {
+              core.notice("Nothing to backfill for mode " + mode + ".");
+              return;
+            }
+
+            if (mode === "labels-only") {
+              core.notice("Label catalog synchronization completed by the bootstrap step.");
+              return;
+            }
+
+            const state = mode === "all-items" ? "all" : "open";
+            const items = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state,
+              per_page: 100
+            });
+            const limited = items.slice(0, 500);
+            if (items.length > limited.length) {
+              core.warning("Backfill capped at 500 items for one run.");
+            }
+
+            const systemLabel = "system/" + process.env.PRIMARY_SYSTEM;
+            for (const item of limited) {
+              const isPR = Boolean(item.pull_request);
+              const labels = new Set((item.labels || []).map(label => typeof label === "string" ? label : label.name));
+              const desired = [systemLabel, isPR ? "kind/pull-request" : "kind/issue"];
+              if (!isPR && item.state === "open" && ![...labels].some(label => label.startsWith("status/"))) desired.push("status/triage");
+              if (dryRun) {
+                core.notice("Would reconcile #" + item.number + " with " + desired.join(", "));
+              } else {
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: item.number,
+                  labels: desired
+                });
+              }
+            }
+            core.notice((dryRun ? "Dry-run inspected " : "Reconciled ") + limited.length + " items.");
+
+  merge-gate:
+    name: Governed merge gate
+    if: github.event_name == 'pull_request_review' && github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      checks: read
+      statuses: read
+    env:
+      ENABLE_AUTO_MERGE: ${{ inputs.enable_auto_merge }}
+    steps:
+        - name: Mark approved current HEAD verified and arm governed auto-merge
+          uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+          with:
+            script: |
+              const owner = context.repo.owner;
+              const repo = context.repo.repo;
+              const prNumber = context.payload.pull_request.number;
+              const prResponse = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+              const pr = prResponse.data;
+              if (pr.state !== "open" || pr.draft) return;
+
+              if (pr.head.repo?.full_name !== owner + "/" + repo) {
+                core.notice("Fork pull requests require maintainer-controlled completion; automatic merge was not armed.");
+                return;
+              }
+
+              const reviewerLogin = context.payload.review?.user?.login || "";
+              const reviewerType = context.payload.review?.user?.type || "";
+              const trustedCopilotApproval = reviewerType === "Bot" && reviewerLogin === "copilot-pull-request-reviewer[bot]";
+
+              if (!trustedCopilotApproval) {
+                const permission = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner,
+                  repo,
+                  username: reviewerLogin
+                });
+                if (!["write", "maintain", "admin"].includes(permission.data.permission)) {
+                  core.notice("Ignoring approval from a reviewer without write-level repository authority.");
+                  return;
+                }
+              }
+
+              const reviewedCommit = context.payload.review?.commit_id;
+              if (reviewedCommit && reviewedCommit !== pr.head.sha) {
+                core.notice("Ignoring stale approval for " + reviewedCommit + "; current HEAD is " + pr.head.sha + ".");
+                return;
+              }
+
+              const reviewThreads = await github.graphql(
+                "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved comments(first:20){nodes{author{login} body}}} pageInfo{hasNextPage}}}}}",
+                { owner, repo, number: prNumber }
+              );
+
+              const threadConnection = reviewThreads.repository.pullRequest.reviewThreads;
+              if (threadConnection.pageInfo.hasNextPage) {
+                core.warning("More than 100 review threads exist; refusing to infer a clean state automatically.");
+                return;
+              }
+
+              const actionablePattern = /\\b(fix|must|should|issue|bug|incorrect|failure|fails|problem|risk|vulnerab|security|performance|regression|recommend|suggest|add|change|replace|remove|avoid|consider|instead|refactor|optimiz|leak|race|deadlock|exception|error)\\w*\\b/i;
+              const unresolvedAiFindings = threadConnection.nodes.filter(thread => {
+                if (thread.isResolved) return false;
+                return (thread.comments?.nodes || []).some(comment =>
+                  /(copilot|codex|claude)/i.test(comment.author?.login || "") &&
+                  actionablePattern.test(comment.body || "")
+                );
+              });
+
+              if (unresolvedAiFindings.length) {
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  labels: ["finding/actionable", "review/required"]
+                });
+                core.notice("Approval received, but unresolved actionable AI review threads remain; merge was not armed.");
+                return;
+              }
+
+              const issue = await github.rest.issues.get({ owner, repo, issue_number: prNumber });
+              const labels = new Set((issue.data.labels || []).map(label => typeof label === "string" ? label : label.name));
+              const manualGate = ["security/manual-review", "governance/manual-review", "agent/manual", "no-agent"].some(label => labels.has(label));
+              const blocked = labels.has("status/agent-blocked");
+
+              if (blocked) return;
+
+              const statusLabels = [
+                "status/triage",
+                "status/draft",
+                "status/implementation",
+                "status/needs-review",
+                "status/remediation",
+                "status/verified",
+                "status/merge-ready",
+                "status/awaiting-final-approval",
+                "status/agent-blocked",
+                "status/merged",
+                "status/closed"
+              ];
+
+              for (const label of [...statusLabels, "agent/remediation", "finding/actionable", "review/required"]) {
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: label });
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+              }
+
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: prNumber,
+                labels: ["finding/resolved", manualGate ? "status/awaiting-final-approval" : "status/verified"]
+              });
+
+              if (manualGate || process.env.ENABLE_AUTO_MERGE !== "true") return;
+
+              const repoInfo = await github.rest.repos.get({ owner, repo });
+              const methods = [];
+              if (repoInfo.data.allow_squash_merge) methods.push("SQUASH");
+              if (repoInfo.data.allow_merge_commit) methods.push("MERGE");
+              if (repoInfo.data.allow_rebase_merge) methods.push("REBASE");
+
+              let armed = false;
+              for (const mergeMethod of methods) {
+                try {
+                  await github.graphql(
+                    "mutation($id:ID!,$method:PullRequestMergeMethod!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:$method}){pullRequest{number}}}",
+                    { id: pr.node_id, method: mergeMethod }
+                  );
+                  armed = true;
+                  try {
+                    await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: "status/verified" });
+                  } catch (error) {
+                    if (error.status !== 404) throw error;
+                  }
+                  await github.rest.issues.addLabels({
+                    owner,
+                    repo,
+                    issue_number: prNumber,
+                    labels: ["status/merge-ready"]
+                  });
+                  core.notice("GitHub auto-merge armed using " + mergeMethod + ". Branch protections and rulesets remain authoritative.");
+                  break;
+                } catch (error) {
+                  core.warning("Could not arm auto-merge with " + mergeMethod + ": " + error.message);
+                }
+              }
+
+              if (!armed) {
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: "status/verified" });
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  labels: ["status/awaiting-final-approval"]
+                });
+              }
+
+
+

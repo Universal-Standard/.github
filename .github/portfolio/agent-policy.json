@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "defaultFixer": "copilot",
+  "customAgent": "universal-remediation-agent",
+  "autoAssignNewIssues": true,
+  "excludedLabels": [
+    "agent/manual",
+    "no-agent",
+    "security/manual-review",
+    "governance/manual-review"
+  ],
+  "maxRemediationPasses": 10,
+  "maxRepeatedFindingPasses": 2,
+  "requireSamePullRequestBranch": true,
+  "forkPullRequestAutofix": false,
+  "agentTasksApiVersion": "2026-03-10"
+}
