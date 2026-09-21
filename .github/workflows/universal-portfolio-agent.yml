@@ -73,7 +73,6 @@ jobs:
 
     steps:
       - name: Bootstrap labels, classify systems, and maintain lifecycle state
-        if: github.event_name != 'workflow_dispatch'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
@@ -225,11 +224,10 @@ jobs:
                 await setLifecycle("status/needs-review");
                 await addLabels(["review/required"]);
               } else if (action === "synchronize") {
-                await removeLabel("status/verified");
-                await removeLabel("status/merge-ready");
                 await removeLabel("finding/resolved");
                 if (!currentLabels.has("status/remediation")) {
-                  await addLabels(["status/needs-review", "review/required"]);
+                  await setLifecycle("status/needs-review");
+                  await addLabels(["review/required"]);
                 }
               }
             }
@@ -345,32 +343,52 @@ jobs:
             let prNumber;
             let body = "";
             let reviewState = "";
+            let actorType = "";
 
             if (event === "issue_comment") {
               if (!context.payload.issue?.pull_request) return;
               prNumber = context.payload.issue.number;
               body = context.payload.comment?.body || "";
-              if (context.payload.comment?.user?.type === "Bot" && !/(copilot|codex|claude)/i.test(actor)) return;
+              actorType = context.payload.comment?.user?.type || "";
             } else if (event === "pull_request_review_comment") {
               prNumber = context.payload.pull_request.number;
               body = context.payload.comment?.body || "";
+              actorType = context.payload.comment?.user?.type || "";
             } else {
               prNumber = context.payload.pull_request.number;
               body = context.payload.review?.body || "";
               reviewState = (context.payload.review?.state || "").toLowerCase();
+              actorType = context.payload.review?.user?.type || "";
             }
 
             if (!prNumber || body.includes("<!-- universal-remediation-pass:")) return;
 
-            const aiReviewer = /(copilot|codex|claude)/i.test(actor);
+            const aiReviewer = actorType === "Bot" && /(copilot|codex|claude)/i.test(actor);
             const explicitCommand = /^\\s*\\/remediate\\b/i.test(body);
+
+            if (explicitCommand && !aiReviewer) {
+              const permission = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner,
+                repo,
+                username: actor
+              });
+              if (!["write", "maintain", "admin"].includes(permission.data.permission)) {
+                core.warning("Ignoring /remediate from a user without write-level repository access.");
+                return;
+              }
+            }
+
             if (!aiReviewer && !explicitCommand) return;
 
-            const actionable = reviewState === "changes_requested" ||
-              /\\b(fix|must|should|issue|bug|incorrect|failure|fails|problem|risk|vulnerab|security|performance|regression|recommend|suggest|leak|race|deadlock|exception|error)\\w*\\b/i.test(body);
-            const cleanOnly = /\\b(no (?:issues|findings|problems)|looks good|approved|lgtm|no changes requested)\\b/i.test(body) && !actionable;
+            const actionPattern = /\\b(fix|must|should|issue|bug|incorrect|failure|fails|problem|risk|vulnerab|security|performance|regression|recommend|suggest|add|change|replace|remove|avoid|consider|instead|refactor|optimiz|leak|race|deadlock|exception|error)\\w*\\b/i;
+            const cleanOnly = /\\b(no (?:issues|findings|problems)|looks good|approved|lgtm|no changes requested)\\b/i.test(body);
+            const actionable = !cleanOnly && (
+              reviewState === "changes_requested" ||
+              (event === "pull_request_review_comment" && aiReviewer) ||
+              actionPattern.test(body)
+            );
 
-            if (!actionable || cleanOnly) {
+            if (!actionable) {
               core.notice("Review event does not contain an actionable remediation signal.");
               return;
             }
@@ -379,13 +397,41 @@ jobs:
             const pr = prResponse.data;
             if (pr.state !== "open" || pr.draft) return;
 
-            if (pr.head.repo?.full_name !== owner + "/" + repo) {
+            const lifecycleStatuses = [
+              "status/triage",
+              "status/draft",
+              "status/implementation",
+              "status/needs-review",
+              "status/remediation",
+              "status/verified",
+              "status/merge-ready",
+              "status/awaiting-final-approval",
+              "status/agent-blocked",
+              "status/merged",
+              "status/closed"
+            ];
+
+            async function setLifecycle(status, extras = []) {
+              const issueState = await github.rest.issues.get({ owner, repo, issue_number: prNumber });
+              const currentLabels = new Set((issueState.data.labels || []).map(label => typeof label === "string" ? label : label.name));
+              for (const label of lifecycleStatuses) {
+                if (label === status || !currentLabels.has(label)) continue;
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: label });
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+              }
               await github.rest.issues.addLabels({
                 owner,
                 repo,
                 issue_number: prNumber,
-                labels: ["status/agent-blocked"]
+                labels: [status, ...extras]
               });
+            }
+
+            if (pr.head.repo?.full_name !== owner + "/" + repo) {
+              await setLifecycle("status/agent-blocked", ["finding/actionable"]);
               await github.rest.issues.createComment({
                 owner,
                 repo,
@@ -405,14 +451,15 @@ jobs:
               .map(comment => comment.body || "")
               .filter(text => text.includes("<!-- universal-remediation-pass:"));
 
+            const activeHeadMarker = passMarkers.find(marker => marker.includes("head=" + pr.head.sha));
+            if (activeHeadMarker) {
+              core.notice("A remediation pass has already been started for current HEAD " + pr.head.sha + "; aggregating will resume after the agent pushes a new commit.");
+              return;
+            }
+
             const maxPasses = Number(process.env.MAX_REMEDIATION_PASSES || "10");
             if (passMarkers.length >= maxPasses) {
-              await github.rest.issues.addLabels({
-                owner,
-                repo,
-                issue_number: prNumber,
-                labels: ["status/agent-blocked", "finding/actionable"]
-              });
+              await setLifecycle("status/agent-blocked", ["finding/actionable"]);
               await github.rest.issues.createComment({
                 owner,
                 repo,
@@ -423,7 +470,7 @@ jobs:
             }
 
             function isActionableText(text) {
-              return /\\b(fix|must|should|issue|bug|incorrect|failure|fails|problem|risk|vulnerab|security|performance|regression|recommend|suggest|leak|race|deadlock|exception|error)\\w*\\b/i.test(text || "");
+              return actionPattern.test(text || "");
             }
 
             const findings = [];
@@ -457,12 +504,7 @@ jobs:
 
             const repeated = passMarkers.filter(marker => marker.includes("signature=" + signature)).length;
             if (repeated >= 2) {
-              await github.rest.issues.addLabels({
-                owner,
-                repo,
-                issue_number: prNumber,
-                labels: ["status/agent-blocked", "finding/actionable"]
-              });
+              await setLifecycle("status/agent-blocked", ["finding/actionable"]);
               await github.rest.issues.createComment({
                 owner,
                 repo,
@@ -506,30 +548,12 @@ jobs:
               }
             });
 
-            for (const label of [
-              "status/triage",
-              "status/draft",
-              "status/implementation",
-              "status/needs-review",
-              "status/verified",
-              "status/merge-ready",
-              "status/awaiting-final-approval",
-              "status/merged",
-              "status/closed",
-              "finding/resolved"
-            ]) {
-              try {
-                await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: label });
-              } catch (error) {
-                if (error.status !== 404) throw error;
-              }
+            try {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: "finding/resolved" });
+            } catch (error) {
+              if (error.status !== 404) throw error;
             }
-            await github.rest.issues.addLabels({
-              owner,
-              repo,
-              issue_number: prNumber,
-              labels: ["agent/remediation", "status/remediation", "finding/actionable", "review/required"]
-            });
+            await setLifecycle("status/remediation", ["agent/remediation", "finding/actionable", "review/required"]);
 
             await github.rest.issues.createComment({
               owner,
@@ -637,6 +661,43 @@ jobs:
             const pr = prResponse.data;
             if (pr.state !== "open" || pr.draft) return;
 
+            const reviewedCommit = context.payload.review?.commit_id;
+            if (reviewedCommit && reviewedCommit !== pr.head.sha) {
+              core.notice("Ignoring stale approval for " + reviewedCommit + "; current HEAD is " + pr.head.sha + ".");
+              return;
+            }
+
+            const reviewThreads = await github.graphql(
+              "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved comments(first:20){nodes{author{login} body}}} pageInfo{hasNextPage}}}}}",
+              { owner, repo, number: prNumber }
+            );
+
+            const threadConnection = reviewThreads.repository.pullRequest.reviewThreads;
+            if (threadConnection.pageInfo.hasNextPage) {
+              core.warning("More than 100 review threads exist; refusing to infer a clean state automatically.");
+              return;
+            }
+
+            const actionablePattern = /\\b(fix|must|should|issue|bug|incorrect|failure|fails|problem|risk|vulnerab|security|performance|regression|recommend|suggest|add|change|replace|remove|avoid|consider|instead|refactor|optimiz|leak|race|deadlock|exception|error)\\w*\\b/i;
+            const unresolvedAiFindings = threadConnection.nodes.filter(thread => {
+              if (thread.isResolved) return false;
+              return (thread.comments?.nodes || []).some(comment =>
+                /(copilot|codex|claude)/i.test(comment.author?.login || "") &&
+                actionablePattern.test(comment.body || "")
+              );
+            });
+
+            if (unresolvedAiFindings.length) {
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: prNumber,
+                labels: ["finding/actionable", "review/required"]
+              });
+              core.notice("Approval received, but unresolved actionable AI review threads remain; merge was not armed.");
+              return;
+            }
+
             const issue = await github.rest.issues.get({ owner, repo, issue_number: prNumber });
             const labels = new Set((issue.data.labels || []).map(label => typeof label === "string" ? label : label.name));
             const manualGate = ["security/manual-review", "governance/manual-review", "agent/manual", "no-agent"].some(label => labels.has(label));
@@ -732,6 +793,11 @@ jobs:
             const dryRun = process.env.DRY_RUN === "true";
             if (!["open-items", "all-items", "labels-only", "full-reconcile"].includes(mode)) {
               core.notice("Nothing to backfill for mode " + mode + ".");
+              return;
+            }
+
+            if (mode === "labels-only") {
+              core.notice("Label catalog synchronization completed by the bootstrap step.");
               return;
             }
 
