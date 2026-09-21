@@ -161,15 +161,17 @@ jobs:
             const text = title + "\n" + body;
             const detected = new Set([primaryKey]);
 
+            const escapeRegex = value => value.replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
+
             for (const [key, system] of Object.entries(catalog.systems)) {
-              const structured = new RegExp("\\\\[x-system:\\\\s*" + key.replace(/[.*+?^${{}()|[\\]\\\\]/g, "\\\\$&") + "\\\\s*\\\\]", "i");
+              const structured = new RegExp("\\[x-system:\\s*" + escapeRegex(key) + "\\s*\\]", "i");
               if (structured.test(text)) detected.add(key);
 
               const repositories = [system.canonical, ...(system.aliases || [])];
               for (const fullName of repositories) {
-                const escaped = fullName.replace(/[.*+?^${{}()|[\\]\\\\]/g, "\\\\$&");
-                const issueRef = new RegExp("\\\\b" + escaped + "#\\\\d+\\\\b", "i");
-                const urlRef = new RegExp("github\\\\.com/" + escaped + "/(?:issues|pull)/\\\\d+", "i");
+                const escaped = escapeRegex(fullName);
+                const issueRef = new RegExp("\\b" + escaped + "#\\d+\\b", "i");
+                const urlRef = new RegExp("github\\.com/" + escaped + "/(?:issues|pull)/\\d+", "i");
                 if (issueRef.test(text) || urlRef.test(text)) detected.add(key);
               }
             }
