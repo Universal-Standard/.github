@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "systems": {
+    "atlantis": {
+      "label": "system/atlantis",
+      "canonical": "Universal-Standard/ATLANTIS-AI",
+      "aliases": [
+        "Universal-Standard/atlantis-monorepo",
+        "UniversalStandards/atlantis-ai-enhanced",
+        "UniversalStandards/Atlantis.ai",
+        "UniversalStandards/ATLANTIS-AI---GOOGLE-AI-STUDIO-VERSION",
+        "US-SPURS/ATLANTIS-AI"
+      ]
+    },
+    "swarm": {
+      "label": "system/swarm",
+      "canonical": "Universal-Standard/SWARM",
+      "aliases": [
+        "Universal-Standard/PROJECT-SWARM",
+        "UniversalStandards/SWARM",
+        "UniversalStandards/PROJECT-SWARM",
+        "US-SPURS/SWARM"
+      ]
+    },
+    "hitman": {
+      "label": "system/hitman",
+      "canonical": "Universal-Standard/HITMAN",
+      "aliases": [
+        "Universal-Standard/Project-HITMAN-Original",
+        "UniversalStandards/HITMAN",
+        "US-SPURS/HITMAN"
+      ]
+    },
+    "universal-standards": {
+      "label": "system/universal-standards",
+      "canonical": "UniversalStandards/UniversalStandards",
+      "aliases": []
+    },
+    "caromar": {
+      "label": "system/caromar",
+      "canonical": "Universal-Standard/CAROMAR",
+      "aliases": [
+        "UniversalStandards/CAROMAR"
+      ]
+    },
+    "mcp-server": {
+      "label": "system/mcp-server",
+      "canonical": "Universal-Standard/Universal-Standard-MCP-Server",
+      "aliases": [
+        "UniversalStandards/mcp"
+      ]
+    }
+  },
+  "crossSystemDetection": {
+    "structuredTag": "[x-system: <system>]",
+    "repositoryReferencesOnly": true,
+    "genericArchitectureTermsDoNotImplyAnotherSystem": true
+  }
+}
