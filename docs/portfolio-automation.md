@@ -65,3 +65,8 @@ The remediation circuit breaker also sets `status/agent-blocked` after the confi
 ## Supply-chain policy
 
 External Actions are pinned to immutable full commit SHAs. Upgrades should be proposed and reviewed as dependency changes rather than floating major-version tags.
+
+## Merge-token permission isolation
+
+Caller workflows grant `contents: write` as the maximum permission ceiling required by GitHub auto-merge. The reusable workflow's main control job remains read-only for repository contents. Only the event-scoped `merge-gate` job requests `contents: write`, and that job runs solely for an approved pull-request review. No PR code is checked out or executed by either job.
+
