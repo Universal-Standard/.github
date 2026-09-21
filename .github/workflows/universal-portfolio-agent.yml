@@ -99,6 +99,8 @@ jobs:
             ]);
 
             const definitions = labelPolicy.labels;
+            const forkReadOnly = context.eventName === "pull_request" &&
+              context.payload.pull_request?.head?.repo?.full_name !== owner + "/" + repo;
             const previewOnly = context.eventName === "workflow_dispatch" && process.env.DRY_RUN === "true";
             const existing = await github.paginate(github.rest.issues.listLabelsForRepo, {
               owner,
@@ -109,8 +111,8 @@ jobs:
 
             for (const [name, value] of Object.entries(definitions)) {
               if (existingNames.has(name)) continue;
-              if (previewOnly) {
-                core.notice("Dry-run: would create label " + name);
+              if (previewOnly || forkReadOnly) {
+                core.notice((previewOnly ? "Dry-run" : "Fork PR read-only run") + ": would create label " + name);
                 continue;
               }
               try {
@@ -128,6 +130,11 @@ jobs:
 
             if (!item) {
               core.notice("No issue or pull request for this event; label catalog synchronized.");
+              return;
+            }
+
+            if (forkReadOnly) {
+              core.notice("Skipping repository mutations for a fork pull request. Maintainer-controlled issue/review events remain available for safe follow-up.");
               return;
             }
 
@@ -232,7 +239,7 @@ jobs:
               await setLifecycle("status/triage");
             } else if (event === "issues" && action === "closed") {
               await setLifecycle("status/closed");
-            } else if (event === "pull_request_target") {
+            } else if (event === "pull_request") {
               const pr = context.payload.pull_request;
               if (action === "closed") {
                 await setLifecycle(pr.merged ? "status/merged" : "status/closed");
@@ -262,7 +269,7 @@ jobs:
             }
 
       - name: Apply deterministic path-area labels
-        if: github.event_name == 'pull_request_target'
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7
         with:
           repo-token: ${{ github.token }}
@@ -270,7 +277,7 @@ jobs:
           sync-labels: true
 
       - name: Request Copilot review for the current PR HEAD
-        if: github.event_name == 'pull_request_target' && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || github.event.action == 'synchronize') && github.event.pull_request.draft == false
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || github.event.action == 'synchronize') && github.event.pull_request.draft == false
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
@@ -452,6 +459,16 @@ jobs:
             const pr = prResponse.data;
             if (pr.state !== "open" || pr.draft) return;
 
+            try {
+              await github.graphql(
+                "mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){pullRequest{number}}}",
+                { id: pr.node_id }
+              );
+              core.notice("Disabled any active auto-merge request because actionable review feedback arrived.");
+            } catch (error) {
+              core.notice("No active auto-merge request to disable, or auto-merge is unavailable: " + error.message);
+            }
+
             const lifecycleStatuses = [
               "status/triage",
               "status/draft",
@@ -619,7 +636,7 @@ jobs:
             });
 
       - name: Sync issue or PR into the portfolio Project
-        if: (github.event_name == 'issues' || github.event_name == 'pull_request_target') && env.PROJECTS_TOKEN != '' && env.PORTFOLIO_PROJECT_ID != ''
+        if: (github.event_name == 'issues' || github.event_name == 'pull_request') && env.PROJECTS_TOKEN != '' && env.PORTFOLIO_PROJECT_ID != ''
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
@@ -777,6 +794,27 @@ jobs:
               const prResponse = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
               const pr = prResponse.data;
               if (pr.state !== "open" || pr.draft) return;
+
+              if (pr.head.repo?.full_name !== owner + "/" + repo) {
+                core.notice("Fork pull requests require maintainer-controlled completion; automatic merge was not armed.");
+                return;
+              }
+
+              const reviewerLogin = context.payload.review?.user?.login || "";
+              const reviewerType = context.payload.review?.user?.type || "";
+              const trustedCopilotApproval = reviewerType === "Bot" && reviewerLogin === "copilot-pull-request-reviewer[bot]";
+
+              if (!trustedCopilotApproval) {
+                const permission = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner,
+                  repo,
+                  username: reviewerLogin
+                });
+                if (!["write", "maintain", "admin"].includes(permission.data.permission)) {
+                  core.notice("Ignoring approval from a reviewer without write-level repository authority.");
+                  return;
+                }
+              }
 
               const reviewedCommit = context.payload.review?.commit_id;
               if (reviewedCommit && reviewedCommit !== pr.head.sha) {
