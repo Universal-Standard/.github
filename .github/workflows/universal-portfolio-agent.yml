@@ -704,139 +704,6 @@ jobs:
             await setSingleSelect("Integration State", crossSystem ? "Required" : "Standalone");
             await setText("Repository", owner + "/" + repo);
 
-      - name: Mark approved current HEAD verified and arm governed auto-merge
-        if: github.event_name == 'pull_request_review' && github.event.review.state == 'approved'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const prNumber = context.payload.pull_request.number;
-            const prResponse = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
-            const pr = prResponse.data;
-            if (pr.state !== "open" || pr.draft) return;
-
-            const reviewedCommit = context.payload.review?.commit_id;
-            if (reviewedCommit && reviewedCommit !== pr.head.sha) {
-              core.notice("Ignoring stale approval for " + reviewedCommit + "; current HEAD is " + pr.head.sha + ".");
-              return;
-            }
-
-            const reviewThreads = await github.graphql(
-              "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved comments(first:20){nodes{author{login} body}}} pageInfo{hasNextPage}}}}}",
-              { owner, repo, number: prNumber }
-            );
-
-            const threadConnection = reviewThreads.repository.pullRequest.reviewThreads;
-            if (threadConnection.pageInfo.hasNextPage) {
-              core.warning("More than 100 review threads exist; refusing to infer a clean state automatically.");
-              return;
-            }
-
-            const actionablePattern = /\\b(fix|must|should|issue|bug|incorrect|failure|fails|problem|risk|vulnerab|security|performance|regression|recommend|suggest|add|change|replace|remove|avoid|consider|instead|refactor|optimiz|leak|race|deadlock|exception|error)\\w*\\b/i;
-            const unresolvedAiFindings = threadConnection.nodes.filter(thread => {
-              if (thread.isResolved) return false;
-              return (thread.comments?.nodes || []).some(comment =>
-                /(copilot|codex|claude)/i.test(comment.author?.login || "") &&
-                actionablePattern.test(comment.body || "")
-              );
-            });
-
-            if (unresolvedAiFindings.length) {
-              await github.rest.issues.addLabels({
-                owner,
-                repo,
-                issue_number: prNumber,
-                labels: ["finding/actionable", "review/required"]
-              });
-              core.notice("Approval received, but unresolved actionable AI review threads remain; merge was not armed.");
-              return;
-            }
-
-            const issue = await github.rest.issues.get({ owner, repo, issue_number: prNumber });
-            const labels = new Set((issue.data.labels || []).map(label => typeof label === "string" ? label : label.name));
-            const manualGate = ["security/manual-review", "governance/manual-review", "agent/manual", "no-agent"].some(label => labels.has(label));
-            const blocked = labels.has("status/agent-blocked");
-
-            if (blocked) return;
-
-            const statusLabels = [
-              "status/triage",
-              "status/draft",
-              "status/implementation",
-              "status/needs-review",
-              "status/remediation",
-              "status/verified",
-              "status/merge-ready",
-              "status/awaiting-final-approval",
-              "status/agent-blocked",
-              "status/merged",
-              "status/closed"
-            ];
-
-            for (const label of [...statusLabels, "agent/remediation", "finding/actionable", "review/required"]) {
-              try {
-                await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: label });
-              } catch (error) {
-                if (error.status !== 404) throw error;
-              }
-            }
-
-            await github.rest.issues.addLabels({
-              owner,
-              repo,
-              issue_number: prNumber,
-              labels: ["finding/resolved", manualGate ? "status/awaiting-final-approval" : "status/verified"]
-            });
-
-            if (manualGate || process.env.ENABLE_AUTO_MERGE !== "true") return;
-
-            const repoInfo = await github.rest.repos.get({ owner, repo });
-            const methods = [];
-            if (repoInfo.data.allow_squash_merge) methods.push("SQUASH");
-            if (repoInfo.data.allow_merge_commit) methods.push("MERGE");
-            if (repoInfo.data.allow_rebase_merge) methods.push("REBASE");
-
-            let armed = false;
-            for (const mergeMethod of methods) {
-              try {
-                await github.graphql(
-                  "mutation($id:ID!,$method:PullRequestMergeMethod!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:$method}){pullRequest{number}}}",
-                  { id: pr.node_id, method: mergeMethod }
-                );
-                armed = true;
-                try {
-                  await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: "status/verified" });
-                } catch (error) {
-                  if (error.status !== 404) throw error;
-                }
-                await github.rest.issues.addLabels({
-                  owner,
-                  repo,
-                  issue_number: prNumber,
-                  labels: ["status/merge-ready"]
-                });
-                core.notice("GitHub auto-merge armed using " + mergeMethod + ". Branch protections and rulesets remain authoritative.");
-                break;
-              } catch (error) {
-                core.warning("Could not arm auto-merge with " + mergeMethod + ": " + error.message);
-              }
-            }
-
-            if (!armed) {
-              try {
-                await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: "status/verified" });
-              } catch (error) {
-                if (error.status !== 404) throw error;
-              }
-              await github.rest.issues.addLabels({
-                owner,
-                repo,
-                issue_number: prNumber,
-                labels: ["status/awaiting-final-approval"]
-              });
-            }
-
       - name: Manual portfolio reconciliation and backfill
         if: github.event_name == 'workflow_dispatch'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -886,3 +753,151 @@ jobs:
               }
             }
             core.notice((dryRun ? "Dry-run inspected " : "Reconciled ") + limited.length + " items.");
+
+  merge-gate:
+    name: Governed merge gate
+    if: github.event_name == 'pull_request_review' && github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      checks: read
+      statuses: read
+    env:
+      ENABLE_AUTO_MERGE: ${{ inputs.enable_auto_merge }}
+    steps:
+        - name: Mark approved current HEAD verified and arm governed auto-merge
+          uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+          with:
+            script: |
+              const owner = context.repo.owner;
+              const repo = context.repo.repo;
+              const prNumber = context.payload.pull_request.number;
+              const prResponse = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+              const pr = prResponse.data;
+              if (pr.state !== "open" || pr.draft) return;
+
+              const reviewedCommit = context.payload.review?.commit_id;
+              if (reviewedCommit && reviewedCommit !== pr.head.sha) {
+                core.notice("Ignoring stale approval for " + reviewedCommit + "; current HEAD is " + pr.head.sha + ".");
+                return;
+              }
+
+              const reviewThreads = await github.graphql(
+                "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved comments(first:20){nodes{author{login} body}}} pageInfo{hasNextPage}}}}}",
+                { owner, repo, number: prNumber }
+              );
+
+              const threadConnection = reviewThreads.repository.pullRequest.reviewThreads;
+              if (threadConnection.pageInfo.hasNextPage) {
+                core.warning("More than 100 review threads exist; refusing to infer a clean state automatically.");
+                return;
+              }
+
+              const actionablePattern = /\\b(fix|must|should|issue|bug|incorrect|failure|fails|problem|risk|vulnerab|security|performance|regression|recommend|suggest|add|change|replace|remove|avoid|consider|instead|refactor|optimiz|leak|race|deadlock|exception|error)\\w*\\b/i;
+              const unresolvedAiFindings = threadConnection.nodes.filter(thread => {
+                if (thread.isResolved) return false;
+                return (thread.comments?.nodes || []).some(comment =>
+                  /(copilot|codex|claude)/i.test(comment.author?.login || "") &&
+                  actionablePattern.test(comment.body || "")
+                );
+              });
+
+              if (unresolvedAiFindings.length) {
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  labels: ["finding/actionable", "review/required"]
+                });
+                core.notice("Approval received, but unresolved actionable AI review threads remain; merge was not armed.");
+                return;
+              }
+
+              const issue = await github.rest.issues.get({ owner, repo, issue_number: prNumber });
+              const labels = new Set((issue.data.labels || []).map(label => typeof label === "string" ? label : label.name));
+              const manualGate = ["security/manual-review", "governance/manual-review", "agent/manual", "no-agent"].some(label => labels.has(label));
+              const blocked = labels.has("status/agent-blocked");
+
+              if (blocked) return;
+
+              const statusLabels = [
+                "status/triage",
+                "status/draft",
+                "status/implementation",
+                "status/needs-review",
+                "status/remediation",
+                "status/verified",
+                "status/merge-ready",
+                "status/awaiting-final-approval",
+                "status/agent-blocked",
+                "status/merged",
+                "status/closed"
+              ];
+
+              for (const label of [...statusLabels, "agent/remediation", "finding/actionable", "review/required"]) {
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: label });
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+              }
+
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: prNumber,
+                labels: ["finding/resolved", manualGate ? "status/awaiting-final-approval" : "status/verified"]
+              });
+
+              if (manualGate || process.env.ENABLE_AUTO_MERGE !== "true") return;
+
+              const repoInfo = await github.rest.repos.get({ owner, repo });
+              const methods = [];
+              if (repoInfo.data.allow_squash_merge) methods.push("SQUASH");
+              if (repoInfo.data.allow_merge_commit) methods.push("MERGE");
+              if (repoInfo.data.allow_rebase_merge) methods.push("REBASE");
+
+              let armed = false;
+              for (const mergeMethod of methods) {
+                try {
+                  await github.graphql(
+                    "mutation($id:ID!,$method:PullRequestMergeMethod!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:$method}){pullRequest{number}}}",
+                    { id: pr.node_id, method: mergeMethod }
+                  );
+                  armed = true;
+                  try {
+                    await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: "status/verified" });
+                  } catch (error) {
+                    if (error.status !== 404) throw error;
+                  }
+                  await github.rest.issues.addLabels({
+                    owner,
+                    repo,
+                    issue_number: prNumber,
+                    labels: ["status/merge-ready"]
+                  });
+                  core.notice("GitHub auto-merge armed using " + mergeMethod + ". Branch protections and rulesets remain authoritative.");
+                  break;
+                } catch (error) {
+                  core.warning("Could not arm auto-merge with " + mergeMethod + ": " + error.message);
+                }
+              }
+
+              if (!armed) {
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: "status/verified" });
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  labels: ["status/awaiting-final-approval"]
+                });
+              }
+
+
+
