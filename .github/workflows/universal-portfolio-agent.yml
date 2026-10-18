@@ -520,8 +520,9 @@ jobs:
             ]);
 
             const passMarkers = issueComments
+              .filter(comment => comment.user?.type === "Bot" && comment.user?.login === "github-actions[bot]")
               .map(comment => comment.body || "")
-              .filter(text => text.includes("<!-- universal-remediation-pass:"));
+              .filter(text => /^<!-- universal-remediation-pass:\d+ signature=[0-9a-f]{16} head=[0-9a-f]{40} -->/i.test(text));
 
             const activeHeadMarker = passMarkers.find(marker => marker.includes("head=" + pr.head.sha));
             if (activeHeadMarker) {
